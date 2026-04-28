@@ -1,0 +1,11 @@
+services:
+  go-cidr-api:
+    image: kcilnk/go-cidr-api:latest
+    container_name: go-cidr-api
+    restart: unless-stopped
+    ports:
+      - "30662:30662"
+    environment:
+      RUN_MODE: http
+      ADDR: ":30662"
+      DATA_FILE: /app/china_city_cidrs.compact.json

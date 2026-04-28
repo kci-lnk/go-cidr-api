@@ -1,0 +1,18 @@
+.DS_Store
+
+# Build artifacts
+dist/
+*.out
+*.test
+coverage.out
+
+# Local binaries
+cidr-api
+main
+
+# Editor / IDE
+.idea/
+.vscode/
+
+# Local Docker publish overrides
+deploy/docker/.env

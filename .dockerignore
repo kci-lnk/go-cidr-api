@@ -1,0 +1,14 @@
+.git
+.gitignore
+.DS_Store
+
+# Build artifacts
+dist/
+*.out
+*.test
+coverage.out
+cidr-api
+main
+
+# Local Docker config
+deploy/docker/.env
