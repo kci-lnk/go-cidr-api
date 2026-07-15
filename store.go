@@ -6,24 +6,32 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
+
+	"go-cidr-api/internal/cidrdata"
 )
 
 var (
-	ErrProvinceNotFound = errors.New("province not found")
-	ErrCityNotFound     = errors.New("city not found")
-	ErrInvalidIPVersion = errors.New("invalid ip version")
-
-	autonomousPrefectureSuffixPattern = regexp.MustCompile(`(?:蒙古(?:族)?|回族|藏族|维吾尔(?:族)?|苗族|彝族|壮族|布依族|朝鲜族|满族|侗族|瑶族|白族|土家族|哈尼族|哈萨克(?:族)?|傣族|黎族|傈僳族|佤族|畲族|高山族|拉祜族|水族|东乡族|纳西族|景颇族|柯尔克孜(?:族)?|土族|达斡尔族|仫佬族|羌族|布朗族|撒拉族|毛南族|仡佬族|锡伯族|阿昌族|普米族|塔吉克(?:族)?|怒族|乌孜别克族|俄罗斯族|鄂温克族|德昂族|保安族|裕固族|京族|塔塔尔族|独龙族|鄂伦春族|赫哲族|门巴族|珞巴族|基诺族)+自治州$`)
+	ErrProvinceNotFound  = errors.New("province not found")
+	ErrCityNotFound      = errors.New("city not found")
+	ErrInvalidIPVersion  = errors.New("invalid ip version")
+	ErrInvalidOperator   = errors.New("invalid operator")
+	ErrSelectorConflict  = errors.New("selector conflicts with location parameters")
+	ErrSelectorAmbiguous = errors.New("selector is ambiguous")
 )
 
-type rawDataset map[string]map[string]map[string][]string
+type rawDataset = cidrdata.Dataset
+
+type cityReference struct {
+	province string
+	city     string
+}
 
 type Store struct {
 	data          rawDataset
 	provinceNames []string
+	cityIndex     map[string][]cityReference
 }
 
 type ProvinceItem struct {
@@ -40,11 +48,35 @@ type CityItem struct {
 type CIDRQueryResult struct {
 	Province   string              `json:"province"`
 	City       string              `json:"city,omitempty"`
+	Operator   string              `json:"operator,omitempty"`
 	IPVersion  string              `json:"ip_version,omitempty"`
 	Count      int                 `json:"count,omitempty"`
 	CIDRs      []string            `json:"cidrs,omitempty"`
 	CIDRGroups map[string][]string `json:"cidr_groups,omitempty"`
 	Counts     map[string]int      `json:"counts,omitempty"`
+}
+
+func (r CIDRQueryResult) MarshalJSON() ([]byte, error) {
+	type resultAlias CIDRQueryResult
+	if r.IPVersion == "" {
+		return json.Marshal(resultAlias(r))
+	}
+	type versionResult struct {
+		Province  string   `json:"province"`
+		City      string   `json:"city,omitempty"`
+		Operator  string   `json:"operator,omitempty"`
+		IPVersion string   `json:"ip_version"`
+		Count     int      `json:"count"`
+		CIDRs     []string `json:"cidrs"`
+	}
+	return json.Marshal(versionResult{
+		Province:  r.Province,
+		City:      r.City,
+		Operator:  r.Operator,
+		IPVersion: r.IPVersion,
+		Count:     r.Count,
+		CIDRs:     r.CIDRs,
+	})
 }
 
 func LoadStore(dataFile string) (*Store, error) {
@@ -64,14 +96,28 @@ func LoadStore(dataFile string) (*Store, error) {
 	}
 
 	provinceNames := make([]string, 0, len(data))
+	cityIndex := make(map[string][]cityReference)
 	for province := range data {
 		provinceNames = append(provinceNames, province)
+		for city := range data[province] {
+			key := normalizeLookupKey(city)
+			cityIndex[key] = append(cityIndex[key], cityReference{province: province, city: city})
+		}
 	}
 	sort.Strings(provinceNames)
+	for key := range cityIndex {
+		sort.Slice(cityIndex[key], func(i, j int) bool {
+			if cityIndex[key][i].province == cityIndex[key][j].province {
+				return cityIndex[key][i].city < cityIndex[key][j].city
+			}
+			return cityIndex[key][i].province < cityIndex[key][j].province
+		})
+	}
 
 	return &Store{
 		data:          data,
 		provinceNames: provinceNames,
+		cityIndex:     cityIndex,
 	}, nil
 }
 
@@ -100,23 +146,29 @@ func (s *Store) ListCities(province string) (string, []CityItem, error) {
 
 	items := make([]CityItem, 0, len(cityNames))
 	for _, city := range cityNames {
+		cityData := cities[city]
 		items = append(items, CityItem{
 			Name:      displayName(city),
-			IPv4Count: len(cities[city]["4"]),
-			IPv6Count: len(cities[city]["6"]),
+			IPv4Count: len(cityData.IPv4),
+			IPv6Count: len(cityData.IPv6),
 		})
 	}
 
 	return displayName(resolvedProvince), items, nil
 }
 
-func (s *Store) GetCIDRs(province, city, ipVersion string) (CIDRQueryResult, error) {
+func (s *Store) GetCIDRs(province, city, operator, ipVersion string) (CIDRQueryResult, error) {
 	resolvedProvince, cities, err := s.lookupProvince(province)
 	if err != nil {
 		return CIDRQueryResult{}, err
 	}
 
 	version, err := normalizeIPVersion(ipVersion)
+	if err != nil {
+		return CIDRQueryResult{}, err
+	}
+
+	normalizedOperator, err := normalizeOperator(operator)
 	if err != nil {
 		return CIDRQueryResult{}, err
 	}
@@ -131,34 +183,37 @@ func (s *Store) GetCIDRs(province, city, ipVersion string) (CIDRQueryResult, err
 		result := CIDRQueryResult{
 			Province: displayName(resolvedProvince),
 			City:     displayName(resolvedCity),
+			Operator: normalizedOperator,
 		}
+		versionData := cityVersionData(cityData, normalizedOperator)
 
 		if version == "" {
 			result.CIDRGroups = map[string][]string{
-				"4": cloneCIDRs(cityData["4"]),
-				"6": cloneCIDRs(cityData["6"]),
+				"4": cloneCIDRs(versionData.IPv4),
+				"6": cloneCIDRs(versionData.IPv6),
 			}
 			result.Counts = map[string]int{
-				"4": len(cityData["4"]),
-				"6": len(cityData["6"]),
+				"4": len(versionData.IPv4),
+				"6": len(versionData.IPv6),
 			}
 			return result, nil
 		}
 
 		result.IPVersion = version
-		result.CIDRs = cloneCIDRs(cityData[version])
+		result.CIDRs = cloneCIDRs(versionData.CIDRs(version))
 		result.Count = len(result.CIDRs)
 		return result, nil
 	}
 
 	result := CIDRQueryResult{
 		Province: displayName(resolvedProvince),
+		Operator: normalizedOperator,
 	}
 
 	if version == "" {
 		result.CIDRGroups = map[string][]string{
-			"4": aggregateCIDRs(cities, "4"),
-			"6": aggregateCIDRs(cities, "6"),
+			"4": aggregateCIDRs(cities, "4", normalizedOperator),
+			"6": aggregateCIDRs(cities, "6", normalizedOperator),
 		}
 		result.Counts = map[string]int{
 			"4": len(result.CIDRGroups["4"]),
@@ -168,12 +223,60 @@ func (s *Store) GetCIDRs(province, city, ipVersion string) (CIDRQueryResult, err
 	}
 
 	result.IPVersion = version
-	result.CIDRs = aggregateCIDRs(cities, version)
+	result.CIDRs = aggregateCIDRs(cities, version, normalizedOperator)
 	result.Count = len(result.CIDRs)
 	return result, nil
 }
 
-func (s *Store) lookupProvince(province string) (string, map[string]map[string][]string, error) {
+func (s *Store) ResolveSelector(selector string) (string, string, string, error) {
+	query := strings.TrimSpace(selector)
+	if query == "" {
+		return "", "", "", fmt.Errorf("%w: empty selector", ErrCityNotFound)
+	}
+
+	if ref, err := s.resolveIndexedCity(query); err == nil {
+		return ref.province, ref.city, "", nil
+	} else if errors.Is(err, ErrSelectorAmbiguous) {
+		return "", "", "", err
+	}
+
+	for _, operator := range cidrdata.Operators {
+		if !strings.HasSuffix(query, operator) {
+			continue
+		}
+		cityQuery := strings.TrimSpace(strings.TrimSuffix(query, operator))
+		if cityQuery == "" {
+			break
+		}
+		ref, err := s.resolveIndexedCity(cityQuery)
+		if err != nil {
+			if errors.Is(err, ErrSelectorAmbiguous) {
+				return "", "", "", err
+			}
+			continue
+		}
+		return ref.province, ref.city, operator, nil
+	}
+	return "", "", "", fmt.Errorf("%w: %s", ErrCityNotFound, query)
+}
+
+func (s *Store) resolveIndexedCity(city string) (cityReference, error) {
+	key := normalizeLookupKey(city)
+	references := s.cityIndex[key]
+	if len(references) == 0 {
+		return cityReference{}, fmt.Errorf("%w: %s", ErrCityNotFound, city)
+	}
+	if len(references) > 1 {
+		candidates := make([]string, 0, len(references))
+		for _, reference := range references {
+			candidates = append(candidates, displayName(reference.province)+"/"+displayName(reference.city))
+		}
+		return cityReference{}, fmt.Errorf("%w: %s (%s)", ErrSelectorAmbiguous, city, strings.Join(candidates, ", "))
+	}
+	return references[0], nil
+}
+
+func (s *Store) lookupProvince(province string) (string, map[string]*cidrdata.CityData, error) {
 	query := strings.TrimSpace(province)
 	if query == "" {
 		return "", nil, ErrProvinceNotFound
@@ -193,7 +296,7 @@ func (s *Store) lookupProvince(province string) (string, map[string]map[string][
 	return "", nil, fmt.Errorf("%w: %s", ErrProvinceNotFound, query)
 }
 
-func lookupCity(cities map[string]map[string][]string, city string) (string, map[string][]string, error) {
+func lookupCity(cities map[string]*cidrdata.CityData, city string) (string, *cidrdata.CityData, error) {
 	query := strings.TrimSpace(city)
 	if query == "" {
 		return "", nil, ErrCityNotFound
@@ -226,46 +329,28 @@ func normalizeIPVersion(value string) (string, error) {
 	}
 }
 
+func normalizeOperator(value string) (string, error) {
+	operator, err := cidrdata.NormalizeOperator(value)
+	if err != nil {
+		return "", fmt.Errorf("%w: %s", ErrInvalidOperator, value)
+	}
+	return operator, nil
+}
+
 func normalizeLookupKey(value string) string {
 	return displayName(value)
 }
 
 func displayName(value string) string {
-	normalized := strings.TrimSpace(strings.ReplaceAll(value, "　", ""))
-	if normalized == "" {
-		return ""
-	}
-
-	normalized = autonomousPrefectureSuffixPattern.ReplaceAllString(normalized, "")
-
-	suffixes := []string{
-		"维吾尔自治区",
-		"回族自治区",
-		"壮族自治区",
-		"特别行政区",
-		"自治区",
-		"自治州",
-		"地区",
-		"盟",
-		"省",
-		"市",
-	}
-
-	for _, suffix := range suffixes {
-		if strings.HasSuffix(normalized, suffix) {
-			return strings.TrimSuffix(normalized, suffix)
-		}
-	}
-
-	return normalized
+	return cidrdata.DisplayName(value)
 }
 
-func aggregateCIDRs(cities map[string]map[string][]string, version string) []string {
+func aggregateCIDRs(cities map[string]*cidrdata.CityData, version, operator string) []string {
 	seen := make(map[string]struct{})
 	aggregated := make([]string, 0)
 
 	for _, cityData := range cities {
-		for _, cidr := range cityData[version] {
+		for _, cidr := range cityVersionData(cityData, operator).CIDRs(version) {
 			if _, ok := seen[cidr]; ok {
 				continue
 			}
@@ -276,6 +361,19 @@ func aggregateCIDRs(cities map[string]map[string][]string, version string) []str
 
 	sort.Strings(aggregated)
 	return aggregated
+}
+
+func cityVersionData(cityData *cidrdata.CityData, operator string) cidrdata.VersionData {
+	if cityData == nil {
+		return cidrdata.VersionData{}
+	}
+	if operator == "" {
+		return cityData.VersionData
+	}
+	if data := cityData.Operators[operator]; data != nil {
+		return *data
+	}
+	return cidrdata.VersionData{}
 }
 
 func cloneCIDRs(cidrs []string) []string {

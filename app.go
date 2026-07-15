@@ -58,10 +58,10 @@ func (a *App) route(method, rawPath string, query url.Values) (int, responseEnve
 				"GET /healthz",
 				"GET /api/v1/provinces",
 				"GET /api/v1/provinces/{province}/cities",
-				"GET /api/v1/provinces/{province}/cidrs?ip_version=4|6",
-				"GET /api/v1/provinces/{province}/cities/{city}/cidrs?ip_version=4|6",
-				"GET /api/v1/cidrs?province=甘肃&ip_version=4|6",
-				"GET /api/v1/cidrs?province=广东&city=深圳&ip_version=4|6",
+				"GET /api/v1/provinces/{province}/cidrs?operator=移动&ip_version=4|6",
+				"GET /api/v1/provinces/{province}/cities/{city}/cidrs?operator=移动&ip_version=4|6",
+				"GET /api/v1/cidrs?province=广东&city=深圳&operator=电信&ip_version=4|6",
+				"GET /api/v1/cidrs?selector=石家庄移动&ip_version=4|6",
 			},
 		})
 	case "/healthz":
@@ -73,7 +73,7 @@ func (a *App) route(method, rawPath string, query url.Values) (int, responseEnve
 			"total": len(items),
 		})
 	case "/api/v1/cidrs":
-		return a.handleCIDRs(query.Get("province"), query.Get("city"), query.Get("ip_version"))
+		return a.handleCIDRQuery(query)
 	}
 
 	segments := splitPath(cleanPath)
@@ -82,7 +82,7 @@ func (a *App) route(method, rawPath string, query url.Values) (int, responseEnve
 		segments[1] == "v1" &&
 		segments[2] == "provinces" &&
 		segments[4] == "cidrs" {
-		return a.handleCIDRs(segments[3], "", query.Get("ip_version"))
+		return a.handleCIDRs(segments[3], "", query.Get("operator"), query.Get("ip_version"))
 	}
 
 	if len(segments) == 5 &&
@@ -99,7 +99,7 @@ func (a *App) route(method, rawPath string, query url.Values) (int, responseEnve
 		segments[2] == "provinces" &&
 		segments[4] == "cities" &&
 		segments[6] == "cidrs" {
-		return a.handleCIDRs(segments[3], segments[5], query.Get("ip_version"))
+		return a.handleCIDRs(segments[3], segments[5], query.Get("operator"), query.Get("ip_version"))
 	}
 
 	return errorResponse(http.StatusNotFound, "route not found")
@@ -122,12 +122,30 @@ func (a *App) handleCities(province string) (int, responseEnvelope) {
 	})
 }
 
-func (a *App) handleCIDRs(province, city, ipVersion string) (int, responseEnvelope) {
+func (a *App) handleCIDRQuery(query url.Values) (int, responseEnvelope) {
+	selector := strings.TrimSpace(query.Get("selector"))
+	if selector == "" {
+		return a.handleCIDRs(query.Get("province"), query.Get("city"), query.Get("operator"), query.Get("ip_version"))
+	}
+	if strings.TrimSpace(query.Get("province")) != "" ||
+		strings.TrimSpace(query.Get("city")) != "" ||
+		strings.TrimSpace(query.Get("operator")) != "" {
+		return errorResponse(http.StatusBadRequest, ErrSelectorConflict.Error())
+	}
+
+	province, city, operator, err := a.store.ResolveSelector(selector)
+	if err != nil {
+		return storeErrorResponse(err)
+	}
+	return a.handleCIDRs(province, city, operator, query.Get("ip_version"))
+}
+
+func (a *App) handleCIDRs(province, city, operator, ipVersion string) (int, responseEnvelope) {
 	if strings.TrimSpace(province) == "" {
 		return errorResponse(http.StatusBadRequest, "province is required")
 	}
 
-	result, err := a.store.GetCIDRs(province, city, ipVersion)
+	result, err := a.store.GetCIDRs(province, city, operator, ipVersion)
 	if err != nil {
 		return storeErrorResponse(err)
 	}
@@ -143,6 +161,10 @@ func storeErrorResponse(err error) (int, responseEnvelope) {
 		return errorResponse(http.StatusNotFound, err.Error())
 	case errors.Is(err, ErrInvalidIPVersion):
 		return errorResponse(http.StatusBadRequest, err.Error())
+	case errors.Is(err, ErrInvalidOperator), errors.Is(err, ErrSelectorConflict):
+		return errorResponse(http.StatusBadRequest, err.Error())
+	case errors.Is(err, ErrSelectorAmbiguous):
+		return errorResponse(http.StatusConflict, err.Error())
 	default:
 		return errorResponse(http.StatusInternalServerError, err.Error())
 	}

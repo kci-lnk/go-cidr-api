@@ -1,6 +1,6 @@
 # go-cidr-api
 
-基于 Go 的中国省市 CIDR 查询 API。数据源使用当前目录下的 `china_city_cidrs.compact.json`，部署方式调整为：
+基于 Go 的中国大陆省市及运营商 CIDR 查询 API。数据源使用当前目录下的 `china_city_cidrs.compact.json`，可从 ip2region XDB 数据库重新生成。部署方式调整为：
 
 - 腾讯云 Web 函数
 - 通过函数 URL 直接触发
@@ -45,18 +45,20 @@ curl http://127.0.0.1:8080/api/v1/provinces
 curl "http://127.0.0.1:8080/api/v1/provinces/广东/cities"
 ```
 
-### 4. 根据省、市查询 CIDR
+### 4. 根据省、市、运营商查询 CIDR
 
 路径风格：
 
 ```bash
 curl "http://127.0.0.1:8080/api/v1/provinces/广东/cities/深圳/cidrs?ip_version=4"
+curl "http://127.0.0.1:8080/api/v1/provinces/河北/cities/石家庄/cidrs?operator=移动&ip_version=4"
 ```
 
 查询参数风格：
 
 ```bash
 curl "http://127.0.0.1:8080/api/v1/cidrs?province=广东&city=深圳&ip_version=4"
+curl "http://127.0.0.1:8080/api/v1/cidrs?province=河北&city=石家庄&operator=移动&ip_version=4"
 ```
 
 ### 5. 只传省份，查询全省 CIDR
@@ -71,7 +73,22 @@ curl "http://127.0.0.1:8080/api/v1/provinces/甘肃/cidrs?ip_version=4"
 
 ```bash
 curl "http://127.0.0.1:8080/api/v1/cidrs?province=甘肃&ip_version=4"
+curl "http://127.0.0.1:8080/api/v1/cidrs?province=河北&operator=电信&ip_version=4"
 ```
+
+### 6. 使用 selector 查询
+
+`selector` 可以只传城市，也可以在城市名后追加 `电信`、`联通` 或 `移动`：
+
+```bash
+curl "http://127.0.0.1:8080/api/v1/cidrs?selector=石家庄&ip_version=4"
+curl "http://127.0.0.1:8080/api/v1/cidrs?selector=石家庄移动&ip_version=4"
+curl "http://127.0.0.1:8080/api/v1/cidrs?selector=北京电信&ip_version=6"
+```
+
+`selector` 不能和 `province`、`city`、`operator` 同时使用，但可以和 `ip_version` 一起使用。当前数据没有重名城市；如果后续 XDB 出现重名城市，selector 查询会返回 HTTP 409，并提示候选省市。
+
+运营商参数只接受 `电信`、`联通`、`移动`。不传运营商时仍返回该城市或省份的全部 CIDR。
 
 ## 名称规则
 
@@ -87,6 +104,48 @@ curl "http://127.0.0.1:8080/api/v1/cidrs?province=甘肃&ip_version=4"
 - `广东` 和 `广东省`
 - `北京` 和 `北京市`
 - `深圳` 和 `深圳市`
+
+## 从 XDB 生成数据
+
+将 XDB 文件放在本仓库已忽略的 `ipdata/` 目录：
+
+```text
+ipdata/base_full_v4.xdb
+ipdata/base_full_v6.xdb
+```
+
+然后运行：
+
+```bash
+task data:generate
+```
+
+也可以指定其他输入目录或输出文件：
+
+```bash
+task data:generate IPDATA_DIR=/path/to/ipdata
+task data:generate IPDATA_DIR=/path/to/ipdata OUTPUT=/tmp/china-city-cidrs.json
+```
+
+生成器会校验 XDB Header，流式读取 IPv4/IPv6 segment index，仅保留中国大陆 31 个省级行政区，并以临时文件加原子重命名的方式更新输出文件。城市节点保留原有的 `4`、`6` 字段，并增加可选的运营商数据：
+
+```json
+{
+  "河北省": {
+    "石家庄": {
+      "4": ["1.2.3.0/24"],
+      "6": ["2001:db8::/48"],
+      "operators": {
+        "电信": {"4": ["1.2.3.0/25"]},
+        "联通": {"4": ["1.2.3.128/26"]},
+        "移动": {"6": ["2001:db8::/49"]}
+      }
+    }
+  }
+}
+```
+
+原始 ISP 字段按 `/` 拆分。`电信/中国电信`、`联通/中国联通`、`移动/中国移动/铁通/中移铁通` 会归一到三个运营商；一个混合 ISP 网段可以同时进入多个运营商集合，未匹配的 ISP 仍保留在城市总集合中。
 
 ## 本地调试
 
@@ -226,6 +285,7 @@ task tidy
 task fmt
 task test
 task check
+task data:generate
 task run:http
 task run:web
 task build

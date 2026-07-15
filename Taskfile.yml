@@ -6,6 +6,8 @@ vars:
   DOCKER_IMAGE_REPO: '{{default "" .DOCKER_IMAGE_REPO}}'
   DOCKER_PLATFORMS: '{{default "" .DOCKER_PLATFORMS}}'
   DOCKER_PORT: '{{default "" .DOCKER_PORT}}'
+  IPDATA_DIR: '{{default "ipdata" .IPDATA_DIR}}'
+  OUTPUT: '{{default "china_city_cidrs.compact.json" .OUTPUT}}'
 
 tasks:
   default:
@@ -22,12 +24,17 @@ tasks:
   fmt:
     desc: Format Go source files
     cmds:
-      - gofmt -w *.go
+      - gofmt -w *.go cmd/generate-cidrs/*.go internal/cidrdata/*.go internal/cidrgen/*.go
 
   test:
     desc: Run Go tests
     cmds:
       - go test ./...
+
+  'data:generate':
+    desc: Generate mainland China city and operator CIDRs from IPv4/IPv6 XDB files
+    cmds:
+      - go run ./cmd/generate-cidrs -v4-xdb '{{.IPDATA_DIR}}/base_full_v4.xdb' -v6-xdb '{{.IPDATA_DIR}}/base_full_v6.xdb' -output '{{.OUTPUT}}'
 
   check:
     desc: Run tidy, fmt, and tests

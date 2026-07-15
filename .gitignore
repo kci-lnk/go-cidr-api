@@ -16,3 +16,4 @@ main
 
 # Local Docker publish overrides
 deploy/docker/.env
+ipdata
