@@ -3,5 +3,6 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 export PORT="${PORT:-9000}"
+export DATA_FILE="${DATA_FILE:-${SCRIPT_DIR}/china_city_cidrs.compact.json}"
 
 exec "${SCRIPT_DIR}/cidr-api" -mode=web -addr="0.0.0.0:${PORT}"

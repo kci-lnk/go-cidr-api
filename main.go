@@ -1,7 +1,9 @@
 package main
 
 import (
+	_ "embed"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
@@ -10,11 +12,19 @@ import (
 	"time"
 )
 
+//go:embed VERSION
+var releaseVersion string
+
 func main() {
+	version := flag.Bool("version", false, "print the release version")
 	mode := flag.String("mode", envOrDefault("RUN_MODE", "http"), "run mode: http | web")
 	addr := flag.String("addr", strings.TrimSpace(os.Getenv("ADDR")), "http listen address")
 	dataFile := flag.String("data-file", envOrDefault("DATA_FILE", "china_city_cidrs.compact.json"), "path to cidr data json")
 	flag.Parse()
+	if *version {
+		fmt.Println(strings.TrimSpace(releaseVersion))
+		return
+	}
 
 	store, err := LoadStore(*dataFile)
 	if err != nil {

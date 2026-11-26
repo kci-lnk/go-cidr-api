@@ -1,0 +1,160 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  release-assets:
+    name: Build and publish GitHub Release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@d8cbb8045d7f43706b9177cceb36c1f91a6644d5 # v7
+        with:
+          go-version: '1.26.x'
+
+      - name: Validate tag against VERSION
+        id: version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(cat VERSION)
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ || "$TAG" != "v$version" ]]; then
+            echo "::error::Expected a vMAJOR.MINOR.PATCH tag matching VERSION."
+            exit 1
+          fi
+          printf 'version=%s\n' "$version" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        run: go test ./...
+
+      - name: Build binaries, CIDR data, and Tencent Cloud SCF package
+        run: |
+          mkdir -p dist/release
+          DIST_DIR="$RUNNER_TEMP/scf" bash scripts/build-web.sh
+          cp "$RUNNER_TEMP/scf/cidr-api" dist/release/cidr-api-linux-amd64
+          cp "$RUNNER_TEMP/scf/cidr-api-function-url.zip" dist/release/
+          cp china_city_cidrs.compact.json dist/release/
+          for target in linux/arm64 darwin/amd64 darwin/arm64 windows/amd64; do
+            IFS=/ read -r os architecture <<< "$target"
+            binary="dist/release/cidr-api-$os-$architecture"
+            if [[ "$os" == windows ]]; then binary+=.exe; fi
+            GOOS="$os" GOARCH="$architecture" CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o "$binary" .
+          done
+          cd dist/release
+          sha256sum cidr-api-* china_city_cidrs.compact.json > SHA256SUMS
+
+      - name: Verify the deployed layout of the SCF package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          package_dir="$RUNNER_TEMP/scf-check"
+          unzip -q dist/release/cidr-api-function-url.zip -d "$package_dir"
+          cmp china_city_cidrs.compact.json "$package_dir/china_city_cidrs.compact.json"
+          cmp dist/release/cidr-api-linux-amd64 "$package_dir/cidr-api"
+          test -x "$package_dir/scf_bootstrap"
+          test "$("$package_dir/cidr-api" -version)" = "$VERSION"
+
+          cd "$RUNNER_TEMP"
+          env -u PORT -u DATA_FILE "$package_dir/scf_bootstrap" &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          curl -fsS --retry 15 --retry-delay 1 --retry-connrefused --max-time 10 http://127.0.0.1:9000/healthz |
+            jq -e '.code == 0 and .data.status == "ok"'
+          for family in 4 6; do
+            curl -fsS --max-time 10 --get --data-urlencode 'selector=北京电信' --data-urlencode "ip_version=$family" \
+              http://127.0.0.1:9000/api/v1/cidrs |
+              jq -e --arg family "$family" '.code == 0 and .data.ip_version == $family and .data.count > 0'
+          done
+
+      - name: Publish public release and checksums
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          if draft=$(gh release view "$TAG" --json isDraft --jq .isDraft); then
+            if [[ "$draft" == false ]]; then
+              echo "$TAG is already published."
+              exit 0
+            fi
+          else
+            gh release create "$TAG" --draft --verify-tag --generate-notes --title "$TAG"
+          fi
+          gh release upload "$TAG" dist/release/* --clobber
+          gh release edit "$TAG" --draft=false
+
+  publish-docker:
+    name: Publish Docker Hub images
+    needs: release-assets
+    runs-on: ubuntu-latest
+    concurrency:
+      group: docker-hub-publish
+      cancel-in-progress: false
+    env:
+      IMAGE: kcilnk/go-cidr-api
+      VERSION: ${{ needs.release-assets.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4
+
+      - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME || 'kcilnk' }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push the multi-arch version
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7
+        with:
+          context: .
+          file: deploy/docker/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ env.IMAGE }}:${{ env.VERSION }}
+          build-args: APP_VERSION=${{ env.VERSION }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish architecture tags and promote latest
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          manifest=$(docker buildx imagetools inspect --raw "$IMAGE:$VERSION")
+          for architecture in amd64 arm64; do
+            digest=$(jq -er --arg architecture "$architecture" '
+              [.manifests[] | select(.platform.os == "linux" and .platform.architecture == $architecture) | .digest]
+              | if length == 1 then .[0] else error("Expected a single Linux platform manifest") end
+            ' <<< "$manifest")
+            docker buildx imagetools create --prefer-index=false --tag "$IMAGE:$VERSION-$architecture" "$IMAGE@$digest"
+          done
+
+          latest_tag=$(git ls-remote --tags --refs origin 'v*' |
+            sed -nE 's@^[[:xdigit:]]+[[:space:]]+refs/tags/(v[0-9]+\.[0-9]+\.[0-9]+)$@\1@p' |
+            sort -V | tail -n 1)
+          if [[ "$TAG" == "$latest_tag" ]]; then
+            docker buildx imagetools create --tag "$IMAGE:latest" "$IMAGE:$VERSION"
+          fi

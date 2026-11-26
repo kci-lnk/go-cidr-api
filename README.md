@@ -211,7 +211,7 @@ ZIP 内包含：
 - 运行环境：Golang
 - 启动文件：项目内的 `scf_bootstrap`
 
-`scf_bootstrap` 已在项目根目录提供，内容见 [scf_bootstrap](/Volumes/PSSD/Local/go-cidr-api/scf_bootstrap)。
+`scf_bootstrap` 已在项目根目录提供，内容见 [scf_bootstrap](scf_bootstrap)。
 
 ### 3. 开启函数 URL
 
@@ -226,6 +226,24 @@ https://<app-id>-<url-id>.<region>.tencentscf.com
 ```bash
 curl "https://<your-function-url>/api/v1/cidrs?province=甘肃&ip_version=4"
 ```
+
+## GitHub Release
+
+先运行 `task data:generate`，提交生成的 `china_city_cidrs.compact.json`，
+然后更新根目录 `VERSION`。推送与 `VERSION` 一致的版本标签会触发发布，例如：
+
+```bash
+git tag -a v0.1.4 -m "Release v0.1.4"
+git push origin v0.1.4
+```
+
+GitHub Release 提供 Linux、macOS、Windows 二进制、CIDR JSON、
+`cidr-api-function-url.zip` 和 `SHA256SUMS`。单独运行二进制时，将 JSON 放在
+启动目录，或通过 `-data-file` 指定文件。腾讯云 Web 函数可直接上传 SCF ZIP。
+
+在仓库 Actions Secrets 中配置具有 Docker Hub 推送权限的 `DOCKERHUB_TOKEN`。
+令牌所属账号与 `kcilnk` 不同时，将账号设为 Actions 变量 `DOCKERHUB_USERNAME`。
+CI 会更新版本标签及对应的架构标签，最高版本标签还会更新 `latest`。
 
 ## Docker 发布
 
